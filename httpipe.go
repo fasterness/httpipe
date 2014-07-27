@@ -5,6 +5,7 @@ package httpipe
 
 import (
 	"bytes"
+	"io"
 	"io/ioutil"
 	"log"
 	"net/http"
@@ -12,13 +13,16 @@ import (
 	"sync/atomic"
 )
 
+var (
+	HEADER_PREFIX string = "X-Httpipe-"
+)
+
 //Context keeps track of the request
 type Context struct {
 	Request  *http.Request
 	Response *http.Response
 	Error    error
-	Body     []byte
-	Session  int64
+	Id       int64
 	Server   *Server
 }
 
@@ -68,7 +72,7 @@ type Server struct {
 	RequestHandlers  []RequestHandler
 	ResponseHandlers []ResponseHandler
 	Transport        *http.Transport
-	Session          int64
+	Id               int64
 }
 
 //New returns a pointer to an initialized Server instance
@@ -106,6 +110,12 @@ func (server *Server) HandleResponse(orig *http.Response, ctx *Context) (resp *h
 	}
 	return
 }
+func (server *Server) AddRequestHandler(handler RequestHandler) {
+	server.RequestHandlers = append(server.RequestHandlers, handler)
+}
+func (server *Server) AddResponseHandler(handler ResponseHandler) {
+	server.ResponseHandlers = append(server.ResponseHandlers, handler)
+}
 
 //ServeHTTP manages the round trip of the request
 func (server *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -115,8 +125,7 @@ func (server *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	nURL.User = r.URL.User
 	// oURL := r.URL
 	r.URL = &nURL
-	log.Printf("Request for %v", r.URL)
-	ctx := &Context{Request: r, Session: atomic.AddInt64(&server.Session, 1), Server: server}
+	ctx := &Context{Request: r, Id: atomic.AddInt64(&server.Id, 1), Server: server}
 	r, resp := server.HandleRequest(r, ctx)
 	if resp == nil {
 		//nobody offered up a cached response, so make the round-trip.
@@ -131,30 +140,34 @@ func (server *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		ctx.Body, err = ioutil.ReadAll(resp.Body)
 		resp = server.HandleResponse(resp, ctx)
-
 		resp.Header.Del("Content-Length")
 		copyHeaders(w.Header(), resp.Header)
 		w.WriteHeader(resp.StatusCode)
-		// _, err = io.Copy(w, resp.Body)
-		w.Write(ctx.Body)
+		io.Copy(w, resp.Body)
 		if err := resp.Body.Close(); err != nil {
-			log.Printf("IO error sending response %v", err)
+			log.Printf("ERROR: IO error sending response %v", err)
+		}
+	} else {
+		resp.Header.Del("Content-Length")
+		copyHeaders(w.Header(), resp.Header)
+		w.WriteHeader(resp.StatusCode)
+		io.Copy(w, resp.Body)
+		if err := resp.Body.Close(); err != nil {
+			log.Printf("ERROR: IO error sending response %v", err)
 		}
 	}
+
 }
 
 //NewResponse creates a new http.Response object with sane defaults
-func NewResponse(r *http.Request, contentType string, status int, body string) *http.Response {
+func NewResponse(r *http.Request, h *http.Header, status int, body []byte) *http.Response {
 	resp := &http.Response{}
 	resp.Request = r
 	resp.TransferEncoding = r.TransferEncoding
-	resp.Header = make(http.Header)
-	resp.Header.Add("Content-Type", contentType)
+	resp.Header = *h
 	resp.StatusCode = status
-	buf := bytes.NewBufferString(body)
-	resp.ContentLength = int64(buf.Len())
+	buf := bytes.NewBuffer(body)
 	resp.Body = ioutil.NopCloser(buf)
 	return resp
 }
